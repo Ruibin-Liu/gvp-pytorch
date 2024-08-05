@@ -9,8 +9,9 @@ from torch.utils.data import IterableDataset
 from . import GVP, GVPConvLayer, LayerNorm
 import torch_cluster, torch_geometric, torch_scatter
 from .data import _normalize, _rbf
+import torch.utils.checkpoint as checkpoint
 
-_NUM_ATOM_TYPES = 9
+_NUM_ATOM_TYPES = 9  # not used anymore, kept for possible back compatibility
 _element_mapping = lambda x: {
     'H' : 0,
     'C' : 1,
@@ -21,6 +22,18 @@ _element_mapping = lambda x: {
     'Cl': 6, 'CL': 6,
     'P' : 7
 }.get(x, 8)
+_element_mapping_protein = lambda x: {
+    'H': 0,
+    'C': 1,
+    'N': 2,
+    'O': 3,
+    'S': 4,
+}.get(x, 5) # without ions, ligands, or non-standard residues, we can use slightly less memory
+
+_atom_name_mapping = lambda x: { 
+        'CE3': 0, 'NE2': 1, 'SD': 2, 'NE': 3, 'ND2': 4, 'OE1': 5, 'O': 6, 'CB': 7, 'ND1': 8, 'CZ': 9, 'CD': 10, 'CD2': 11, 'CG1': 12, 'NE1': 13, 'N': 14, 'NH2': 15, 'CA': 16, 'CG2': 17, 'OG1': 18, 'CH2': 19, 'C': 20, 'CZ3': 21, 'SG': 22, 'OG': 23, 'CD1': 24, 'CE': 25, 'NZ': 26, 'CE2': 27, 'NH1': 28, 'OE2': 29, 'OD2': 30, 'CG': 31, 'OD1': 32, 'CZ2': 33, 'OH': 34, 'CE1': 35, 'OXT': 36, 
+}.get(x, 37)  # all hydrogens and others are 37
+
 _amino_acids = lambda x: {
     'ALA': 0,
     'ARG': 1,
@@ -86,11 +99,19 @@ class BaseTransform:
     :param num_rbf: number of radial bases to encode the distance on each edge
     :device: if "cuda", will do preprocessing on the GPU
     '''
-    def __init__(self, edge_cutoff=4.5, num_rbf=16, device='cpu'):
+    def __init__(self, edge_cutoff=4.5, num_rbf=16, device='cpu', atom_mapping='element'):
         self.edge_cutoff = edge_cutoff
         self.num_rbf = num_rbf
         self.device = device
-            
+        self.atom_mapping = _element_mapping
+        self.use_column = 'element'
+        if atom_mapping == 'element_protein':
+            self.atom_mapping = _element_mapping_protein
+        elif atom_mapping == 'atom_name':
+            self.atom_mapping = _atom_name_mapping
+            self.use_column = 'name'
+        self.num_atom_types = self.atom_mapping('...') + 1 # assumed no record in 'atoms' is '...'
+
     def __call__(self, df):
         '''
         :param df: `pandas.DataFrame` of atomic coordinates
@@ -101,7 +122,7 @@ class BaseTransform:
         with torch.no_grad():
             coords = torch.as_tensor(df[['x', 'y', 'z']].to_numpy(),
                                      dtype=torch.float32, device=self.device)
-            atoms = torch.as_tensor(list(map(_element_mapping, df.element)),
+            atoms = torch.as_tensor(list(map(self.atom_mapping, df[self.use_column])),
                                             dtype=torch.long, device=self.device)
 
             edge_index = torch_cluster.radius_graph(coords, r=self.edge_cutoff)
@@ -125,34 +146,36 @@ class BaseModel(nn.Module):
     
     :param num_rbf: number of radial bases to use in the edge embedding
     '''
-    def __init__(self, num_rbf=16):
+    def __init__(self, num_rbf=16, num_atom_types=9, num_gvp_layers=5, node_dim=(), edge_dim=()):
         
         super().__init__()
+        self.node_dim = node_dim or _DEFAULT_V_DIM
+        self.edge_dim = edge_dim or _DEFAULT_E_DIM
         activations = (F.relu, None)
         
-        self.embed = nn.Embedding(_NUM_ATOM_TYPES, _NUM_ATOM_TYPES)
+        self.embed = nn.Embedding(num_atom_types, num_atom_types)
         
         self.W_e = nn.Sequential(
             LayerNorm((num_rbf, 1)),
-            GVP((num_rbf, 1), _DEFAULT_E_DIM, 
+            GVP((num_rbf, 1), self.edge_dim, 
                 activations=(None, None), vector_gate=True)
         )
         
         self.W_v = nn.Sequential(
-            LayerNorm((_NUM_ATOM_TYPES, 0)),
-            GVP((_NUM_ATOM_TYPES, 0), _DEFAULT_V_DIM,
+            LayerNorm((num_atom_types, 0)),
+            GVP((num_atom_types, 0), self.node_dim,
                 activations=(None, None), vector_gate=True)
         )
         
         self.layers = nn.ModuleList(
-                GVPConvLayer(_DEFAULT_V_DIM, _DEFAULT_E_DIM, 
+                GVPConvLayer(self.node_dim, self.edge_dim, 
                              activations=activations, vector_gate=True) 
-            for _ in range(5))
+            for _ in range(num_gvp_layers)) # original is 5
         
-        ns, _ = _DEFAULT_V_DIM
+        ns, _ = self.node_dim
         self.W_out = nn.Sequential(
-            LayerNorm(_DEFAULT_V_DIM),
-            GVP(_DEFAULT_V_DIM, (ns, 0), 
+            LayerNorm(self.node_dim),
+            GVP(self.node_dim, (ns, 0), 
                 activations=activations, vector_gate=True)
         )
         
@@ -329,7 +352,7 @@ class PPIModel(BaseModel):
     def __init__(self, **kwargs):
         
         super().__init__(**kwargs)
-        ns, _ = _DEFAULT_V_DIM
+        ns, _ = self.node_dim
         self.dense = nn.Sequential(
             nn.Linear(2*ns, 4*ns), nn.ReLU(inplace=True),
             nn.Dropout(p=0.1),
@@ -417,7 +440,7 @@ class LEPModel(BaseModel):
     '''
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        ns, _ = _DEFAULT_V_DIM
+        ns, _ = self.node_dim 
         self.dense = nn.Sequential(
             nn.Linear(2*ns, 4*ns), nn.ReLU(inplace=True),
             nn.Dropout(p=0.1),
@@ -493,7 +516,7 @@ class MSPModel(BaseModel):
     '''
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        ns, _ = _DEFAULT_V_DIM
+        ns, _ = self.node_dim
         self.dense = nn.Sequential(
             nn.Linear(2*ns, 4*ns), nn.ReLU(inplace=True),
             nn.Dropout(p=0.1),
@@ -626,11 +649,182 @@ class RESModel(BaseModel):
     '''
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        ns, _ = _DEFAULT_V_DIM
+        ns, _ = self.node_dim
         self.dense = nn.Sequential(
             nn.Linear(ns, 2*ns), nn.ReLU(inplace=True),
             nn.Dropout(p=0.1),
             nn.Linear(2*ns, 20)
+        )
+    def forward(self, batch):
+        out = super().forward(batch, scatter_mean=False)
+        return out[batch.ca_idx+batch.ptr[:-1]]
+
+########################################################################
+
+class CYSDataset(IterableDataset):
+    '''
+    A `torch.utils.data.IterableDataset` wrapper around a
+    ATOM3D CYS dataset.
+    
+    On each iteration, returns a `torch_geometric.data.Data`
+    graph with the attribute `label` encoding the masked residue
+    identity, `ca_idx` for the node index of the alpha carbon, 
+    and all structural attributes as described in BaseTransform.
+    
+    Excludes hydrogen atoms.
+    
+    :param lmdb_dataset: path to ATOM3D dataset
+    :param split_path: path to the ATOM3D split file
+    '''
+    def __init__(self, lmdb_dataset, split_path):
+        self.dataset = LMDBDataset(lmdb_dataset)
+        self.idx = list(map(int, open(split_path).read().split()))
+        self.transform = BaseTransform()
+        
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            gen = self._dataset_generator(list(range(len(self.idx))), 
+                      shuffle=True)
+        else:  
+            per_worker = int(math.ceil(len(self.idx) / float(worker_info.num_workers)))
+            worker_id = worker_info.id
+            iter_start = worker_id * per_worker
+            iter_end = min(iter_start + per_worker, len(self.idx))
+            gen = self._dataset_generator(list(range(len(self.idx)))[iter_start:iter_end],
+                      shuffle=True)
+        return gen
+    
+    def _dataset_generator(self, indices, shuffle=True):
+        if shuffle: random.shuffle(indices)
+        with torch.no_grad():
+            for idx in indices:
+                data = self.dataset[self.idx[idx]]
+                try:
+                    atoms = data['atoms']
+                except TypeError:
+                    continue
+                n_cys = len(atoms[(atoms.resname == 'CYS') & (atoms.element == 'S')])
+                if n_cys == 0:
+                    continue
+                n_none_cys = 0
+                for sub in data['labels'].itertuples():
+                    _, num, aa = sub.subunit.split('_')
+                    num, aa = int(num), _amino_acids(aa)
+                    if aa == 20: continue
+                    if aa != 4 and n_none_cys > n_cys:
+                        continue
+                    my_atoms = atoms.iloc[data['subunit_indices'][sub.Index]].reset_index(drop=True)
+                    ca_idx = np.where((my_atoms.residue == num) & (my_atoms.name == 'CA'))[0]
+                    if len(ca_idx) != 1: continue
+                    with torch.no_grad():
+                        graph = self.transform(my_atoms)
+                        if aa == 4:
+                            graph.label = 1.0
+                        else:
+                            n_none_cys += 1
+                            graph.label = 0.0
+                        graph.ca_idx = int(ca_idx)
+                        yield graph
+                        
+class CYSModel(BaseModel):
+    '''
+    GVP-GNN for the CYS task.
+    
+    Extends BaseModel to output a 1-dim vector instead of a single
+    scalar for each graph, which can be used as logits in binary 
+    classification.
+    
+    '''
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        ns, _ = self.node_dim
+        self.dense = nn.Sequential(
+            nn.Linear(ns, 2*ns), nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+            nn.Linear(2*ns, 1), nn.Sigmoid(),
+        )
+    def forward(self, batch):
+        out = super().forward(batch, scatter_mean=False)
+        return out[batch.ca_idx+batch.ptr[:-1]]
+
+
+########################################################################
+
+class ABPPDataset(IterableDataset):
+    '''
+    A `torch.utils.data.IterableDataset` wrapper around a
+    ABPP dataset.
+    
+    On each iteration, returns a `torch_geometric.data.Data`
+    graph with the attribute `label` encoding the masked residue
+    identity, `ca_idx` for the node index of the alpha carbon, 
+    and all structural attributes as described in BaseTransform.
+    
+    Excludes hydrogen atoms.
+    
+    :param lmdb_dataset: path to ABPP dataset
+    :param split_path: path to the ABPP split file
+    '''
+    def __init__(self, lmdb_dataset, split_path, atom_mapping='element', edge_cutoff=6.0):
+        self.dataset = LMDBDataset(lmdb_dataset)
+        self.idx = list(map(int, open(split_path).read().split()))
+        self.transform = BaseTransform(atom_mapping=atom_mapping)
+        self.edge_cutoff = edge_cutoff
+        
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            gen = self._dataset_generator(list(range(len(self.idx))), 
+                      shuffle=True)
+        else:  
+            per_worker = int(math.ceil(len(self.idx) / float(worker_info.num_workers)))
+            worker_id = worker_info.id
+            iter_start = worker_id * per_worker
+            iter_end = min(iter_start + per_worker, len(self.idx))
+            gen = self._dataset_generator(list(range(len(self.idx)))[iter_start:iter_end],
+                      shuffle=True)
+        return gen
+    
+    def _dataset_generator(self, indices, shuffle=True):
+        if shuffle: random.shuffle(indices)
+        with torch.no_grad():
+            for idx in indices:
+                data = self.dataset[self.idx[idx]]
+                atoms = data['atoms']
+                for sub in data['labels'].itertuples():
+                    #*_, num, aa = sub.subunit.split('_') # A0A087WZ30_C1008_1008_001 
+                    *_, num, index = sub.subunit.split('_') # af2_ready_ABPP
+                    num, aa = int(num), _amino_acids('CYS') # need to change it back for classical atom3d tasks
+                    if aa == 20: continue
+                    my_atoms = atoms.iloc[data['subunit_indices'][sub.Index]].reset_index(drop=True)
+                    ca_idx = np.where((my_atoms.residue == num) & (my_atoms.name == 'CA'))[0]
+                    if len(ca_idx) != 1: continue
+                        
+                    with torch.no_grad():
+                        graph = self.transform(my_atoms)
+                        graph.label = float(sub.label)
+                        graph.ca_idx = int(ca_idx)
+                        yield graph
+                        
+class ABPPModel(BaseModel):
+    '''
+    GVP-GNN for the ABPP task.
+    
+    Extends BaseModel to output a 3-dim vector instead of a single
+    scalar for each graph, which can be used as logits in 3-way
+    classification.
+    
+    As noted in the manuscript, ABPPModel uses the final alpha
+    carbon embeddings instead of the graph mean embedding.
+    '''
+    def __init__(self, num_gvp_layers=5, dropout=0.1, **kwargs):
+        super().__init__(num_gvp_layers=num_gvp_layers, **kwargs)
+        ns, _ = self.node_dim
+        self.dense = nn.Sequential(
+            nn.Linear(ns, 2*ns), nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout), # original value is 0.1
+            nn.Linear(2*ns,1), # nn.Sigmoid()  # commented out to test autocast
         )
     def forward(self, batch):
         out = super().forward(batch, scatter_mean=False)

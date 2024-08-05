@@ -16,13 +16,13 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     install_requires=[
-        'torch',
+        'torch',  # try to comment torch-related out if conflicting
         'torch_geometric',
         'torch_scatter',
         'torch_cluster',
         'tqdm',
         'numpy',
-        'sklearn',
+        'scikit-learn',
         'atom3d'
     ]
 )
