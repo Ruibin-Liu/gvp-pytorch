@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 from atom3d.datasets import LMDBDataset
-import atom3d.datasets.ppi.neighbors as nb
+from .neighbors import get_subunits, get_negatives
 from torch.utils.data import IterableDataset
 from . import GVP, GVPConvLayer, LayerNorm
 import torch_cluster, torch_geometric, torch_scatter
@@ -308,9 +308,9 @@ class PPIDataset(IterableDataset):
                 pairs = data['atoms_pairs']
                 
                 for i, (ensemble_name, target_df) in enumerate(pairs.groupby(['ensemble'])):
-                    sub_names, (bound1, bound2, _, _) = nb.get_subunits(target_df)
+                    sub_names, (bound1, bound2, _, _) = get_subunits(target_df)
                     positives = neighbors[neighbors.ensemble0 == ensemble_name]
-                    negatives = nb.get_negatives(positives, bound1, bound2)
+                    negatives = get_negatives(positives, bound1, bound2)
                     negatives['label'] = 0
                     labels = self._create_labels(positives, negatives, num_pos=10, neg_pos_ratio=1)
                     
@@ -736,18 +736,103 @@ class CYSModel(BaseModel):
     classification.
     
     '''
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, num_gvp_layers=5, dropout=0.1, **kwargs):
+        super().__init__(num_gvp_layers=num_gvp_layers, **kwargs)
         ns, _ = self.node_dim
         self.dense = nn.Sequential(
             nn.Linear(ns, 2*ns), nn.ReLU(inplace=True),
-            nn.Dropout(p=0.1),
-            nn.Linear(2*ns, 1), nn.Sigmoid(),
+            nn.Dropout(p=dropout), # original value is 0.1
+            nn.Linear(2*ns,1), # nn.Sigmoid()  # commented out to test autocast
         )
+    
     def forward(self, batch):
         out = super().forward(batch, scatter_mean=False)
         return out[batch.ca_idx+batch.ptr[:-1]]
 
+
+########################################################################
+
+class PKADataset(IterableDataset):
+    '''
+    A `torch.utils.data.IterableDataset` wrapper around a
+    PKA dataset.
+    
+    On each iteration, returns a `torch_geometric.data.Data`
+    graph with the attribute `label` encoding the masked residue
+    identity, `ca_idx` for the node index of the alpha carbon, 
+    and all structural attributes as described in BaseTransform.
+    
+    Excludes hydrogen atoms.
+    
+    :param lmdb_dataset: path to ABPP dataset
+    :param split_path: path to the ABPP split file
+    '''
+    def __init__(self, lmdb_dataset, split_path, atom_mapping='element', edge_cutoff=6.0, seed=42):
+        self.dataset = LMDBDataset(lmdb_dataset)
+        self.idx = list(map(int, open(split_path).read().split()))
+        self.transform = BaseTransform(atom_mapping=atom_mapping)
+        self.edge_cutoff = edge_cutoff
+        self.seed = seed
+        self.cys_atom = cys_atom
+        
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            gen = self._dataset_generator(list(range(len(self.idx))), 
+                      shuffle=True)
+        else:  
+            per_worker = int(math.ceil(len(self.idx) / float(worker_info.num_workers)))
+            worker_id = worker_info.id
+            iter_start = worker_id * per_worker
+            iter_end = min(iter_start + per_worker, len(self.idx))
+            gen = self._dataset_generator(list(range(len(self.idx)))[iter_start:iter_end],
+                      shuffle=True)
+        return gen
+    
+    def _dataset_generator(self, indices, shuffle=True):
+        if shuffle:
+            random.seed(self.seed)
+            random.shuffle(indices)
+        with torch.no_grad():
+            for idx in indices:
+                data = self.dataset[self.idx[idx]]
+                atoms = data['atoms']
+                for sub in data['labels'].itertuples():
+                    *_, aa, num, index = sub.subunit.split('_') # 0A087WZ30_CYS1008_1008_001 
+                    num, aa = int(num), _amino_acids(aa) # need to change it back for classical atom3d tasks
+                    if aa == 20: continue
+                    my_atoms = atoms.iloc[data['subunit_indices'][sub.Index]].reset_index(drop=True)
+                    ca_idx = np.where((my_atoms.residue == num) & (my_atoms.name == 'CA'))[0]
+                    if len(ca_idx) != 1: continue
+                        
+                    with torch.no_grad():
+                        graph = self.transform(my_atoms)
+                        graph.label = float(sub.label)
+                        graph.ca_idx = int(ca_idx)
+                        yield graph
+                        
+class PKAModel(BaseModel):
+    '''
+    GVP-GNN for the PKA task.
+    
+    Extends BaseModel to output a 3-dim vector instead of a single
+    scalar for each graph, which can be used as logits in 3-way
+    classification.
+    
+    As noted in the manuscript, ABPPModel uses the final alpha
+    carbon embeddings instead of the graph mean embedding.
+    '''
+    def __init__(self, num_gvp_layers=5, dropout=0.1, **kwargs):
+        super().__init__(num_gvp_layers=num_gvp_layers, **kwargs)
+        ns, _ = self.node_dim
+        self.dense = nn.Sequential(
+            nn.Linear(ns, 2*ns), nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(2*ns,1),
+        )
+    def forward(self, batch):
+        out = super().forward(batch, scatter_mean=False)
+        return out[batch.ca_idx+batch.ptr[:-1]]
 
 ########################################################################
 
@@ -766,11 +851,13 @@ class ABPPDataset(IterableDataset):
     :param lmdb_dataset: path to ABPP dataset
     :param split_path: path to the ABPP split file
     '''
-    def __init__(self, lmdb_dataset, split_path, atom_mapping='element', edge_cutoff=6.0):
+    def __init__(self, lmdb_dataset, split_path, atom_mapping='element', edge_cutoff=6.0, seed=42, cys_atom='CA'):
         self.dataset = LMDBDataset(lmdb_dataset)
         self.idx = list(map(int, open(split_path).read().split()))
         self.transform = BaseTransform(atom_mapping=atom_mapping)
         self.edge_cutoff = edge_cutoff
+        self.seed = seed
+        self.cys_atom = cys_atom
         
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -787,7 +874,9 @@ class ABPPDataset(IterableDataset):
         return gen
     
     def _dataset_generator(self, indices, shuffle=True):
-        if shuffle: random.shuffle(indices)
+        if shuffle:
+            random.seed(self.seed)
+            random.shuffle(indices)
         with torch.no_grad():
             for idx in indices:
                 data = self.dataset[self.idx[idx]]
@@ -798,7 +887,7 @@ class ABPPDataset(IterableDataset):
                     num, aa = int(num), _amino_acids('CYS') # need to change it back for classical atom3d tasks
                     if aa == 20: continue
                     my_atoms = atoms.iloc[data['subunit_indices'][sub.Index]].reset_index(drop=True)
-                    ca_idx = np.where((my_atoms.residue == num) & (my_atoms.name == 'CA'))[0]
+                    ca_idx = np.where((my_atoms.residue == num) & (my_atoms.name == self.cys_atom))[0]
                     if len(ca_idx) != 1: continue
                         
                     with torch.no_grad():
